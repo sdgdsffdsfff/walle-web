@@ -4,12 +4,8 @@ define('YII_DEBUG', false);
 
 // Uncomment to enable dev environment. Recommended for development
 define('YII_ENV', 'prod');
-function d($var) {
-    var_dump($var);
-}
-function dd($var) {
-    die(var_dump($var));
-}
+
+setlocale(LC_CTYPE, 'ru_RU.UTF-8');
 
 return [
     'components' => [

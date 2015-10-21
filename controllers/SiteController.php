@@ -62,12 +62,16 @@ class SiteController extends Controller
     public function actionSignup() {
         $user = new User(['scenario' => 'signup']);
         if ($user->load(Yii::$app->request->post())) {
+            // 项目管理员需要审核
+            if ($user->role == User::ROLE_ADMIN) {
+                $user->status = User::STATUS_INACTIVE;
+            }
             if ($user->save()) {
                 $params = Yii::$app->params;
                 Yii::$app->mail->compose('confirmEmail', ['user' => $user])
                     ->setFrom([$params['support.email'] => $params['support.name']])
                     ->setTo($user->email)
-                    ->setSubject('Complete registration with ' . Yii::$app->name)
+                    ->setSubject('瓦力平台 - ' . $user->realname)
                     ->send();
                 Yii::$app->session->setFlash('user-signed-up');
                 return $this->refresh();
@@ -171,7 +175,7 @@ class SiteController extends Controller
         }
 
         if (Yii::$app->getRequest()->getIsAjax()) {
-            static::renderJson([], $code, $message);
+            static::renderJson([], $code ?: -1, $message);
         } else {
             return $this->render('error', [
                 'name' => $name,

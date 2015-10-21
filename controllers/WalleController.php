@@ -1,56 +1,45 @@
 <?php
+/* *****************************************************************
+ * @Author: wushuiyong
+ * @Created Time : 一  9/21 13:48:30 2015
+ *
+ * @File Name: WalleController.php
+ * @Description:
+ * *****************************************************************/
 
 namespace app\controllers;
+
+use app\components\Repo;
+use yii;
+use yii\data\Pagination;
+use app\components\Command;
+use app\components\Folder;
+use app\components\Git;
+use app\components\Task as WalleTask;
 use app\components\Controller;
-use app\models\DynamicConf;
-use walle\command\Git;
-use walle\command\Sync;
-use walle\command\Task as WalleTask;
-use walle\command\RemoteCmd;
-use walle\config\Config;
 use app\models\Task;
 use app\models\Record;
-use walle\command\Command;
-use app\models\Conf;
+use app\models\Project;
 use app\models\User;
-use yii\data\Pagination;
 
 class WalleController extends Controller {
 
-    private $_config;
+    /**
+     * 项目配置
+     */
+    protected $conf;
 
-    private $_task;
+    /**
+     * 上线任务配置
+     */
+    protected $task;
 
     public $enableCsrfValidation = false;
 
-    public function actionIndex($kw = null, $page = 1, $size = 10) {
-        $size = $this->getParam('per-page') ?: $size;
-        $user = User::findOne(\Yii::$app->user->id);
-        $list = Task::find()
-            ->with('user')
-            ->with('conf');
-        if ($user->role != User::ROLE_ADMIN) {
-            $list->where(['user_id' => \Yii::$app->user->id]);
-        }
-
-        $kw = \Yii::$app->request->post('kw');
-        if ($kw) {
-            $list->andWhere(['or', "commit_id like '%" . $kw . "%'", "title like '%" . $kw . "%'"]);
-        }
-        $tasks = $list->orderBy('id desc');
-        $list = $tasks->offset(($page - 1) * $size)->limit(10)
-            ->asArray()->all();
-
-        $view = $user->role == User::ROLE_ADMIN ? 'admin-list' : 'dev-list';
-        $pages = new Pagination(['totalCount' => $tasks->count(), 'pageSize' => 10]);
-        return $this->render($view, [
-            'list'  => $list,
-            'pages' => $pages,
-        ]);
-    }
 
     /**
      * 发起上线
+     *
      * @throws \Exception
      */
     public function actionStartDeploy() {
@@ -58,410 +47,387 @@ class WalleController extends Controller {
         if (!$taskId) {
             static::renderJson([], -1, '任务号不能为空：）');
         }
-        $this->_task = Task::findOne($taskId);
-        if (!$this->_task) {
+        $this->task = Task::findOne($taskId);
+        if (!$this->task) {
             throw new \Exception('任务号不存在：）');
         }
-        if ($this->_task->user_id != \Yii::$app->user->id) {
+        if ($this->task->user_id != $this->uid) {
             throw new \Exception('不可以操作其它人的任务：）');
         }
         // 任务失败或者审核通过时可发起上线
-        if (!in_array($this->_task->status, [Task::STATUS_PASS, Task::STATUS_FAILED])) {
+        if (!in_array($this->task->status, [Task::STATUS_PASS, Task::STATUS_FAILED])) {
             throw new \Exception('任务不能被重复执行：）');
         }
 
-        // yml配置
-        $this->_config = new Config(Conf::getConfigFile($this->_task->project_id));
-        // db配置
-        $dbConf = Conf::findOne($this->_task->project_id);
-
+        // 配置
+        $this->conf = Project::getConf($this->task->project_id);
         try {
-            if ($this->_task->action == Task::ACTION_ONLINE) {
-                $this->_checkPermission();
-                $this->_gitUpdate();
+            if ($this->task->action == Task::ACTION_ONLINE) {
+                $this->_makeVersion();
+                $this->_initWorkspace();
                 $this->_preDeploy();
+                $this->_gitUpdate();
+                $this->_postDeploy();
                 $this->_rsync();
-                $this->_postRelease();
-                $this->_link();
+                $this->_updateRemoteServers($this->task->link_id);
+                $this->_cleanUp($this->task->link_id);
             } else {
-                $this->_link($this->_task->ex_link_id);
+                $this->_link($this->task->ex_link_id);
             }
 
+            /** 至此已经发布版本到线上了，需要做一些记录工作 */
 
-            $online = DynamicConf::findOne(DynamicConf::K_ONLINE_VERSION);
-            if (!$online) {
-                $online = new DynamicConf();
-                $online->name = DynamicConf::K_ONLINE_VERSION;
-            }
             // 记录此次上线的版本（软链号）和上线之前的版本
-            /// 对于回滚的任务不记录线上版本
-            if ($this->_task->action == Task::ACTION_ONLINE) {
-                $this->_task->link_id = $this->_config->getReleases('release_id');
-                $this->_task->ex_link_id = $dbConf->version;
+            ///对于回滚的任务不记录线上版本
+            if ($this->task->action == Task::ACTION_ONLINE) {
+                $this->task->ex_link_id = $this->conf->version;
             }
-            $this->_task->status = Task::STATUS_DONE;
-            $this->_task->created_at = time();
-            $this->_task->save();
+            $this->task->status = Task::STATUS_DONE;
+            $this->task->save();
 
             // 记录当前线上版本（软链）回滚则是回滚的版本，上线为新版本
-            $dbConf->version = $this->_task->link_id;
-            $dbConf->save();
+            $this->conf->version = $this->task->link_id;
+            $this->conf->save();
         } catch (\Exception $e) {
-            $this->_task->status = Task::STATUS_FAILED;
-            $this->_task->save();
+            $this->task->status = Task::STATUS_FAILED;
+            $this->task->save();
+            // 清理本地部署空间
+            $this->_cleanUp($this->task->link_id);
+
             throw $e;
         }
     }
 
-    /**
-     * 配置项目
-     * @param $projectId
-     * @return string
-     * @throws \Exception
-     */
-    public function actionConfigEdit($projectId = null) {
-        if (\Yii::$app->user->identity->role != User::ROLE_ADMIN) throw new \Exception('非管理员不能操作：（');
-        $conf = $projectId ? Conf::findOne($projectId) : new Conf();
-        $confName = $projectId && $conf ? $conf->conf : static::getParam('conf');
-        if (\Yii::$app->request->getIsPost()) {
-            $conf->attributes = [
-                'user_id' => \Yii::$app->user->id,
-                'created_at' => time(),
-                'name'   => static::getParam('name'),
-                'conf'   => $confName,
-                'level'  => static::getParam('level'),
-            ];
-            if ($conf->save()) {
-
-                Conf::saveConfContext($confName, static::getParam('context'));
-                $this->redirect('/walle/config');
-            }
-        }
-
-        if ($projectId && !$conf) throw new \Exception('找不到项目配置');
-        $conf->context = Conf::getConfContext($projectId ? $conf->conf : Conf::CONF_TPL);
-        return $this->render('config-edit', [
-            'conf' => $conf,
-        ]);
-    }
-
-    /**
-     * 配置项目列表
-     * @return string
-     */
-    public function actionConfig() {
-        $conf = Conf::find();
-
-        $kw = \Yii::$app->request->post('kw');
-        if ($kw) {
-            $conf->where(['like', "name", $kw]);
-        }
-        $conf = $conf->asArray()->all();
-        return $this->render('config', [
-            'list' => $conf,
-        ]);
-    }
 
     /**
      * 提交任务
-     * @param null $projectId
+     *
      * @return string
      */
     public function actionCheck() {
-
-        $projects = Conf::find()->asArray()->all();
+        $projects = Project::find()->asArray()->all();
         return $this->render('check', [
             'projects' => $projects,
         ]);
     }
 
     /**
-     * 提交任务
-     * @param null $projectId
+     * 项目配置检测，提前发现配置不当之处。
+     *
      * @return string
      */
-    public function actionSubmit($projectId = null) {
-        if (\Yii::$app->request->getIsPost()) {
-            $task = new Task();
-            $conf = Conf::findOne($projectId);
-            // 只有线上才需要审核
-            $status = in_array($conf->level, [Conf::LEVEL_PROD]) ? Task::STATUS_SUBMIT : Task::STATUS_PASS;
-            $task->attributes = [
-                'user_id' => \Yii::$app->user->id,
-                'project_id' => (int)static::getParam('projectId'),
-                'status' => $status,
-                'action' => Task::ACTION_ONLINE,
-                'created_at' => time(),
-                'title' => static::getParam('title'),
-                'commit_id' => static::getParam('commit'),
-            ];
-            if ($task->save()) {
-                $this->redirect('/walle/index');
+    public function actionDetection($projectId) {
+        $project = Project::getConf($projectId);
+        $log = [];
+        $code = 0;
+
+        // 本地git ssh-key是否加入deploy-keys列表
+        $revision = Repo::getRevision($project->repo_type);
+        try {
+            $ret = $revision->setConfig($project)->updateRepo();
+            if (!$ret) {
+                $code  = -1;
+                $error = $project->repo_type == Project::REPO_GIT
+                    ? '把ssh-key加入git的deploy-keys列表'
+                    : '用户名密码无误';
+                $log[] = sprintf('宿主机代码检出检测出错，请确认php进程用户%s有代码存储仓库%s读写权限，
+                并且%s。详细错误：%s<br>', Get_Current_User(), $project->deploy_from, $error, $revision->getExeLog());
             }
+        } catch (\Exception $e) {
+            $code = -1;
+            $log[] = sprintf('宿主机检测时发生系统错误：%s<br>', $e->getMessage());
         }
-        if ($projectId) {
-            return $this->render('submit', [
-            ]);
+
+        // 权限与免密码登录检测
+        $task = new WalleTask();
+        try {
+            $task->setConfig($project);
+            $command = sprintf('mkdir -p %s', Project::getReleaseVersionDir('detection'));
+            $ret = $task->runRemoteTaskCommandPackage([$command]);
+            if (!$ret) {
+                $code = -1;
+                $log[] = sprintf('目标机器代码检出检测出错，请确认php进程用户%s用户ssh-key加入目标机器的%s用户ssh-key信任列表，
+                    且%s有目标机器发布版本库%s写入权限。详细错误：%s<br>',
+                    Get_Current_User(), $project->release_user, $project->release_user, $project->release_to, $task->getExeLog());
+            }
+            // 清除
+            $command = sprintf('rm -rf %s', Project::getReleaseVersionDir('detection'));
+            $task->runRemoteTaskCommandPackage([$command]);
+        } catch (\Exception $e) {
+            $code = -1;
+            $log[] = sprintf('目标机检测时发生系统错误：%s<br>', $e->getMessage());
         }
-        $projects = Conf::find()->asArray()->all();
-        return $this->render('select-project', [
-            'projects' => $projects,
-        ]);
+
+        // task 检测todo...
+
+        if ($code === 0) {
+            $log[] = '配置检测通过，恭喜：）';
+        }
+        $this->renderJson(join("<br>", $log), $code);
     }
+
 
     /**
      * 获取线上文件md5
+     *
      * @param $projectId
      */
     public function actionFileMd5($projectId, $file) {
-        $cmd = new RemoteCmd();
-        $config = new Config(Conf::getConfigFile($projectId));
-        $cmd->setConfig($config);
-        $projectDir = $config->getReleases('destination');
+        // 配置
+        $this->conf = Project::getConf($projectId);
+
+        $cmd = new Folder();
+        $cmd->setConfig($this->conf);
+        $projectDir = $this->conf->release_to;
         $file = sprintf("%s/%s", rtrim($projectDir, '/'), $file);
+
         $cmd->getFileMd5($file);
         $log = $cmd->getExeLog();
+
         $this->renderJson(join("<br>", explode(PHP_EOL, $log)));
     }
 
     /**
-     * 获取commit历史
+     * 获取branch分支列表
+     *
      * @param $projectId
      */
-    public function actionGetCommitHistory($projectId) {
-        $git = new Git();
-        $git->setConfig(Conf::getConfigFile($projectId));
-        $proj = Conf::findOne($projectId);
-        if ($proj->level == Conf::LEVEL_PROD) {
-            $list = $git->getTagList();
+    public function actionGetBranch($projectId) {
+        $conf = Project::getConf($projectId);
+
+        $version = Repo::getRevision($conf->repo_type);
+        $version->setConfig($conf);
+        $list = $version->getBranchList();
+
+        $this->renderJson($list);
+    }
+
+    /**
+     * 获取commit历史
+     *
+     * @param $projectId
+     */
+    public function actionGetCommitHistory($projectId, $branch = 'master') {
+        $conf = Project::getConf($projectId);
+        $revision = Repo::getRevision($conf->repo_type);
+        $revision->setConfig($conf);
+        if ($conf->repo_mode == Project::REPO_TAG && $conf->repo_type == Project::REPO_GIT) {
+            $list = $revision->getTagList();
         } else {
-            $list = $git->getCommitList();
+            $list = $revision->getCommitList($branch);
         }
         $this->renderJson($list);
     }
 
     /**
-     * 任务审核
-     * @param $id
-     * @param $operation
+     * 获取commit之间的文件
+     *
+     * @param $projectId
      */
-    public function actionTaskOperation($id, $operation) {
-        $task = Task::findOne($id);
-        if (!$task) {
-            static::renderJson([], -1, '任务号不存在');
-        }
-        $task->status = $operation == 'pass' ? Task::STATUS_PASS : Task::STATUS_REFUSE;
-        $task->save();
-        static::renderJson(['status' => \Yii::t('status', 'task_status_' . $task->status)]);
-    }
+    public function actionGetCommitFile($projectId, $start, $end, $branch = 'trunk') {
+        $conf = Project::getConf($projectId);
+        $revision = Repo::getRevision($conf->repo_type);
+        $revision->setConfig($conf);
+        $list = $revision->getFileBetweenCommits($branch, $start, $end);
 
-
-    /**
-     * 上线管理
-     * @param $taskId
-     * @return string
-     * @throws \Exception
-     */
-    public function actionDeleteTask() {
-        $taskId = $this->getParam('taskId');
-        $task = Task::findOne($taskId);
-        if (!$task) {
-            throw new \Exception('任务号不存在：）');
-        }
-        if ($task->user_id != \Yii::$app->user->id) {
-            throw new \Exception('不可以操作其它人的任务：）');
-        }
-        if ($task->status == Task::STATUS_DONE) {
-            throw new \Exception('不可以删除已上线成功的任务：）');
-        }
-        $ret = $task->delete();
-        if (!$ret) throw new \Exception('删除失败');
-        $this->renderJson([]);
-
+        $this->renderJson($list);
     }
 
     /**
      * 上线管理
-     * @param $taskId
-     * @return string
-     * @throws \Exception
-     */
-    public function actionRollback() {
-        $taskId = $this->getParam('taskId');
-        $this->_task = Task::findOne($taskId);
-        if (!$this->_task) {
-            throw new \Exception('任务号不存在：）');
-        }
-        if ($this->_task->user_id != \Yii::$app->user->id) {
-            throw new \Exception('不可以操作其它人的任务：）');
-        }
-        if ($this->_task->ex_link_id == $this->_task->link_id) {
-            throw new \Exception('已回滚的任务不能再次回滚：（');
-        }
-        $rollbackTask = new Task();
-        $conf = Conf::findOne($this->_task->project_id);
-        // 只有线上才需要审核
-        $status = in_array($conf->level, [Conf::LEVEL_PROD]) ? Task::STATUS_SUBMIT : Task::STATUS_PASS;
-        $rollbackTask->attributes = [
-            'user_id' => \Yii::$app->user->id,
-            'project_id' => $this->_task->project_id,
-            'status' => $status,
-            'action' => Task::ACTION_ROLLBACK,
-            'link_id' => $this->_task->ex_link_id,
-            'ex_link_id' => $this->_task->ex_link_id,
-            'created_at' => time(),
-            'title' => $this->_task->title . ' - 回滚',
-            'commit_id' => $this->_task->commit_id,
-        ];
-        if ($rollbackTask->save()) {
-            $this->renderJson([
-                'url' => in_array($conf->level, [Conf::LEVEL_PROD])
-                    ? '/walle/index'
-                    : '/walle/deploy?taskId=' . $rollbackTask->id,
-            ]);
-        } else {
-            $this->renderJson([], -1, '生成回滚任务失败');
-        }
-    }
-
-    /**
-     * 上线管理
+     *
      * @param $taskId
      * @return string
      * @throws \Exception
      */
     public function actionDeploy($taskId) {
-        $this->_task = Task::findOne($taskId);
-        if (!$this->_task) {
+        $this->task = Task::findOne($taskId);
+        if (!$this->task) {
             throw new \Exception('任务号不存在：）');
         }
-        if ($this->_task->user_id != \Yii::$app->user->id) {
+        if ($this->task->user_id != $this->uid) {
             throw new \Exception('不可以操作其它人的任务：）');
         }
 
         return $this->render('deploy', [
-            'task' => $this->_task,
+            'task' => $this->task,
         ]);
     }
 
-
     /**
      * 获取上线进度
+     *
      * @param $taskId
      */
     public function actionGetProcess($taskId) {
         $record = Record::find()
-            ->select(['action', 'status', 'memo'])
+            ->select(['percent' => 'action', 'status', 'memo', 'command'])
             ->where(['task_id' => $taskId,])
             ->orderBy('id desc')
             ->asArray()->one();
-        $record['percent'] = isset(Record::$ACTION_PERCENT[$record['action']])
-            ? Record::$ACTION_PERCENT[$record['action']]
-            : 0;
+        $record['memo'] = stripslashes($record['memo']);
+        $record['command'] = stripslashes($record['command']);
 
         static::renderJson($record);
     }
 
     /**
-     * 检查目录和权限
+     * 产生一个上线版本
+     */
+    private function _makeVersion() {
+        $version = date("Ymd-His", time());
+        $this->task->link_id = $version;
+        return $this->task->save();
+    }
+
+    /**
+     * 检查目录和权限，工作空间的准备
+     * 每一个版本都单独开辟一个工作空间，防止代码污染
+     *
      * @return bool
      * @throws \Exception
      */
-    private function _checkPermission() {
-        $sync = new Sync();
+    private function _initWorkspace() {
+        $folder = new Folder();
         $sTime = Command::getMs();
-        $sync->setConfig($this->_config);
-        // 本地目录检查
-        $sync->initDirector();
-        // 远程目录检查
-        $ret = $sync->directorAndPermission();
-        // 记录执行日志
-        $log = $sync->getExeLog();
+        $folder->setConfig($this->conf);
+        // 本地宿主机工作区初始化
+        $folder->initLocalWorkspace($this->task->link_id);
+
+        // 远程目标目录检查，并且生成版本目录
+        $ret = $folder->initRemoteVersion($this->task->link_id);
+        // 记录执行时间
         $duration = Command::getMs() - $sTime;
-        Record::saveRecord($sync, $this->_task->id, Record::ACTION_PERMSSION, $duration);
-        if (!$ret) throw new \Exception('检查目录和权限出错');
+        Record::saveRecord($folder, $this->task->id, Record::ACTION_PERMSSION, $duration);
+
+        if (!$ret) throw new \Exception('初始化部署隔离空间出错');
         return true;
     }
 
     /**
      * 更新代码文件
+     *
      * @return bool
      * @throws \Exception
      */
     private function _gitUpdate() {
         // 更新代码文件
-        $git = new Git();
+        $revision = Repo::getRevision($this->conf->repo_type);
         $sTime = Command::getMs();
-        $ret = $git->setConfig($this->_config)
-            ->rollback($this->_task->commit_id); // 更新到指定版本
-        // 记录执行日志
+        $ret = $revision->setConfig($this->conf)
+            ->updateToVersion($this->task); // 更新到指定版本
+        // 记录执行时间
         $duration = Command::getMs() - $sTime;
-        Record::saveRecord($git, $this->_task->id, Record::ACTION_CLONE, $duration);
+        Record::saveRecord($revision, $this->task->id, Record::ACTION_CLONE, $duration);
+
         if (!$ret) throw new \Exception('更新代码文件出错');
         return true;
     }
 
-    private function _preDeploy() {
-        $task = new WalleTask();
-        $sTime = Command::getMs();
-        $task->setConfig($this->_config);
-        $ret = $task->preDeploy();
-        $duration = Command::getMs() - $sTime;
-        Record::saveRecord($task, $this->_task->id, Record::ACTION_CLONE, $duration);
-        if (!$ret) throw new \Exception('前置操作失败');
-        return true;
-    }
-
     /**
-     * 部署时触发操作
+     * 部署前置触发任务
+     * 在部署代码之前的准备工作，如git的一些前置检查、vendor的安装（更新）
      *
      * @return bool
      * @throws \Exception
      */
-    private function _postRelease() {
+    private function _preDeploy() {
         $task = new WalleTask();
         $sTime = Command::getMs();
-        $task->setConfig($this->_config);
-        $ret = $task->postRelease();
+        $task->setConfig($this->conf);
+        $ret = $task->preDeploy($this->task->link_id);
+        // 记录执行时间
         $duration = Command::getMs() - $sTime;
-        Record::saveRecord($task, $this->_task->id, Record::ACTION_CLONE, $duration);
-        if (!$ret) throw new \Exception('前置操作失败');
+        Record::saveRecord($task, $this->task->id, Record::ACTION_PRE_DEPLOY, $duration);
+
+        if (!$ret) throw new \Exception('前置任务操作失败');
+        return true;
+    }
+
+
+    /**
+     * 部署后置触发任务
+     * git代码检出之后，可能做一些调整处理，如vendor拷贝，配置环境适配（mv config-test.php config.php）
+     *
+     * @return bool
+     * @throws \Exception
+     */
+    private function _postDeploy() {
+        $task = new WalleTask();
+        $sTime = Command::getMs();
+        $task->setConfig($this->conf);
+        $ret = $task->postDeploy($this->task->link_id);
+        // 记录执行时间
+        $duration = Command::getMs() - $sTime;
+        Record::saveRecord($task, $this->task->id, Record::ACTION_POST_DEPLOY, $duration);
+
+        if (!$ret) throw new \Exception('后置任务操作失败');
         return true;
     }
 
     /**
      * 同步文件到服务器
+     *
      * @return bool
      * @throws \Exception
      */
     private function _rsync() {
-        $sync = new Sync();
-        $sync->setConfig($this->_config);
+        $folder = new Folder();
+        $folder->setConfig($this->conf);
         // 同步文件
-        foreach ($this->_config->getHosts() as $remoteHost) {
+        foreach (Project::getHosts() as $remoteHost) {
             $sTime = Command::getMs();
-            $ret = $sync->syncFiles($remoteHost);
-            // 记录执行日志
-//            $log = $ret ?: $remoteHost . PHP_EOL . $sync->getLog();
+            $ret = $folder->syncFiles($remoteHost, $this->task->link_id);
+            // 记录执行时间
             $duration = Command::getMs() - $sTime;
-            $x = Record::saveRecord($sync, $this->_task->id, Record::ACTION_SYNC, $duration);
+            Record::saveRecord($folder, $this->task->id, Record::ACTION_SYNC, $duration);
             if (!$ret) throw new \Exception('同步文件到服务器出错');
         }
         return true;
     }
 
     /**
-     * 软链接
+     * 执行远程服务器任务集合
+     * 对于目标机器更多的时候是一台机器完成一组命令，而不是每条命令逐台机器执行
+     *
+     * @param $version
+     * @throws \Exception
      */
-    private function _link($version = null) {
-        // 创建链接指向
-        $remote = new RemoteCmd();
+    private function _updateRemoteServers($version) {
+        $cmd = [];
+        $taskWorker = new WalleTask();
+        $folder     = new Folder();
+
+        // pre-release task
+        if (($preRelease = WalleTask::getRemoteTaskCommand($this->conf->pre_release, $version))) {
+            $cmd[] = $preRelease;
+        }
+        // link
+        if (($linkCmd = $folder->setConfig($this->conf)->getLinkCommand($version))) {
+            $cmd[] = $linkCmd;
+        }
+        // post-release task
+        if (($postRelease = WalleTask::getRemoteTaskCommand($this->conf->post_release, $version))) {
+            $cmd[] = $postRelease;
+        }
+
         $sTime = Command::getMs();
-        $ret = $remote->setConfig($this->_config)->link($version);
-        // 记录执行日志
+        // run the task package
+        $ret = $taskWorker->setConfig($this->conf)->runRemoteTaskCommandPackage($cmd);
+        // 记录执行时间
         $duration = Command::getMs() - $sTime;
-        $ret = Record::saveRecord($remote, $this->_task->id, Record::ACTION_LINK, $duration);
-        if (!$ret) throw new \Exception($version ? '回滚失败' : '创建链接指向出错');
+        Record::saveRecord($taskWorker, $this->task->id, Record::ACTION_UPDATE_REMOTE, $duration);
+        if (!$ret) throw new \Exception('全量更新服务器出错');
+    }
+
+    /**
+     * 收尾工作
+     */
+    private function _cleanUp($version = null) {
+        // 创建链接指向
+        $folder = new Folder();
+        $folder->setConfig($this->conf)
+            ->cleanUp($version);
         return true;
     }
 
